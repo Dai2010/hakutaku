@@ -1,0 +1,14 @@
+# 构建产物
+/haku
+*.o
+*.obj
+
+# 测试与缓存
+__pycache__/
+*.pyc
+*.json
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
