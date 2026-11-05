@@ -1,0 +1,23 @@
+name: static
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: static
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装工具
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq build-essential libssl-dev shellcheck >/dev/null
+          gcc --version | head -1
+      - name: 语法与告警
+        run: gcc -fsyntax-only -std=c17 -Wall -Wextra -Wformat=2 haku.c
+      - name: 构建
+        run: make -j"$(nproc)"
+      - name: shell 检查
+        run: find tests -name '*.sh' -print0 | xargs -0 -r sh -n
