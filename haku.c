@@ -57,9 +57,10 @@ static const int DEFAULT_PORTS[] = {
 };
 #define NDEFAULT ((int)(sizeof DEFAULT_PORTS / sizeof DEFAULT_PORTS[0]))
 
-/* ping 不通时用来判“还活着”的端口，一把 poll 并行，最坏 1 个超时 */
-static const int LIVE_PORTS[] = {80, 443, 22, 53, 445, 5000, 62078, 8080, 9100};
-#define NLIVE ((int)(sizeof LIVE_PORTS / sizeof LIVE_PORTS[0]))
+/*
+ * 端口不再分「发现用 / 详情用」两套：发现阶段也扫同一份表（一批最多 192 个，
+ * 一轮 poll 就能覆盖），否则只有 21/3306 这类端口的设备永远发现不了。
+ */
 
 static const struct {
     int port;
@@ -364,7 +365,7 @@ static int ping_once(uint32_t ip, double *rtt, int *ttl)
 }
 
 static int scan_ports(uint32_t ip, const int *ports, int nports, int timeout_ms,
-                      int *out, int maxout)
+                      int *out, int maxout, int *refused)
 {
     int found = 0;
     const int CH = 192;
@@ -372,6 +373,8 @@ static int scan_ports(uint32_t ip, const int *ports, int nports, int timeout_ms,
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
     sa.sin_addr.s_addr = htonl(ip);
+    if (refused)
+        *refused = 0;
 
     for (int base = 0; base < nports; base += CH) {
         int cnt = nports - base;
@@ -398,6 +401,9 @@ static int scan_ports(uint32_t ip, const int *ports, int nports, int timeout_ms,
                 continue;
             }
             if (errno != EINPROGRESS) {
+                /* 立刻被拒 = 对方 TCP 栈回 RST，这是比 ICMP 硬得多的证据 */
+                if (errno == ECONNREFUSED && refused)
+                    (*refused)++;
                 close(fd);
                 continue;
             }
@@ -423,9 +429,13 @@ static int scan_ports(uint32_t ip, const int *ports, int nports, int timeout_ms,
                     continue;
                 int err = 0;
                 socklen_t el = sizeof err;
-                if (getsockopt(fds[i].fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0) {
-                    if (found < maxout)
-                        out[found++] = pidx[i];
+                if (getsockopt(fds[i].fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0) {
+                    if (err == 0) {
+                        if (found < maxout)
+                            out[found++] = pidx[i];
+                    } else if (err == ECONNREFUSED && refused) {
+                        (*refused)++;
+                    }
                 }
                 close(fds[i].fd);
                 fds[i].fd = -1;
@@ -457,8 +467,12 @@ static void rdns(uint32_t ip, char *out, size_t n)
     sa.sin_addr.s_addr = htonl(ip);
     char host[NI_MAXHOST];
     if (getnameinfo((struct sockaddr *)&sa, sizeof sa, host, sizeof host, NULL, 0,
-                    NI_NAMEREQD) == 0)
-        copy_str(out, n, host);
+                    NI_NAMEREQD) == 0) {
+        /* 不少网关把 PTR 直接填成点分十进制，NI_NAMEREQD 拦不住，会跟 IP 列重复 */
+        struct in_addr tmp;
+        if (inet_pton(AF_INET, host, &tmp) != 1)
+            copy_str(out, n, host);
+    }
 }
 
 /* ---------------------------------------------------------------- MAC / 厂商 */
@@ -806,10 +820,31 @@ static int http_banner(uint32_t ip, int port, int tls, char *out, size_t outsz)
     return 0;
 }
 
-/* ---------------------------------------------------------------- 标签表 */
+/* ---------------------------------------------------------------- 证据与标签 */
+
+/*
+ * 「这台机器存在」的证据按层分。不同网络的差异全落在这张表上：
+ *   家庭 / 校园 / 商超 / 光猫 ARP 代理 / AP 隔离 / ICMP 被丢
+ * 单看一层必然误判，所以每台主机记一个位集，最后由证据组合推结论。
+ */
+enum {
+    EV_ICMP = 1u << 0, /* 回了 ICMP echo —— 最弱，代理也能伪造 */
+    EV_ARP = 1u << 1,  /* Linux：ARP 表里有独立 MAC */
+    EV_RST = 1u << 2,  /* 有端口回 RST —— 真的 TCP 栈，几乎造不了假 */
+    EV_TCP = 1u << 3,  /* 有端口接受连接 */
+    EV_MDNS = 1u << 4,
+    EV_SSDP = 1u << 5,
+    EV_WSD = 1u << 6,
+    EV_NBNS = 1u << 7,
+    EV_HTTP = 1u << 8,
+};
+/* 除 ICMP 以外都算「有独立证据」：代理 ARP 不会替别人应答这些 */
+#define EV_L3 (EV_ARP | EV_RST | EV_TCP | EV_MDNS | EV_SSDP | EV_WSD | EV_NBNS | EV_HTTP)
 
 typedef struct {
     uint32_t ip;
+    unsigned ev;
+    int nvt; /* WS-Discovery 里声明了 NetworkVideoTransmitter */
     char text[96];
 } label_t;
 
@@ -820,13 +855,16 @@ typedef struct {
 
 typedef struct {
     uint32_t ip;
-    int alive;
-    int has_icmp;
+    unsigned ev; /* EV_* 证据位 */
+    int alive;   /* 由 ev 推导，等价于 ev != 0 */
+    int suspect; /* 0 正常 · 1 只有 ICMP · 2 疑似网关代答 */
     double rtt;
     int ttl;
     int nports;
+    int nrefused; /* 回 RST 的端口数：真机铁证 */
     int ports[MAXPORTS];
     char name[128];
+    char svc[96]; /* 设备自报的身份：mDNS 实例 / SSDP friendlyName / NetBIOS 名 */
     char banner[160];
     int nlabels;
     char labels[MAXLABELS][96];
@@ -836,13 +874,16 @@ typedef struct {
     char vendor[48];
 } host_t;
 
-static void labeltab_add(labeltab_t *t, uint32_t ip, const char *text)
+static void labeltab_add(labeltab_t *t, uint32_t ip, unsigned ev, int nvt, const char *text)
 {
     if (!text || !*text)
         return;
     for (int i = 0; i < t->n; i++)
-        if (t->v[i].ip == ip && strncasecmp(t->v[i].text, text, 18) == 0)
+        if (t->v[i].ip == ip && strncasecmp(t->v[i].text, text, 18) == 0) {
+            t->v[i].ev |= ev;
+            t->v[i].nvt |= nvt;
             return;
+        }
     if (t->n == t->cap) {
         int cap = t->cap ? t->cap * 2 : 16;
         label_t *nv = realloc(t->v, (size_t)cap * sizeof *nv);
@@ -1107,7 +1148,7 @@ static void *mdns_thread(void *arg)
             char first[128];
             split_first(rrs[i].owner, first, sizeof first);
             if (first[0] && ip_to_u32(rrs[i].value, &ip))
-                labeltab_add(tab, ip, first);
+                labeltab_add(tab, ip, EV_MDNS, 0, first);
         } else if (rrs[i].type == 33) {
             int hit = 0;
             for (int k = 0; k < nn; k++) {
@@ -1125,7 +1166,7 @@ static void *mdns_thread(void *arg)
                 snprintf(label, sizeof label, "%.95s[%.30s]", inst, svc);
             else
                 snprintf(label, sizeof label, "%s", inst);
-            labeltab_add(tab, ip, label);
+            labeltab_add(tab, ip, EV_MDNS, 0, label);
         }
     }
     free(rrs);
@@ -1176,15 +1217,15 @@ static void *ssdp_thread(void *arg)
         const char *keys[] = {"friendlyname:", "modelname:", "modelname:", "server:"};
         const char *label = NULL;
         for (int k = 0; k < 3 && !label; k++) {
-            char *p = buf;
-            while (p && *p) {
-                char *eol = strstr(p, "\r\n");
+            char *cur = buf;
+            while (cur && *cur) {
+                char *eol = strstr(cur, "\r\n");
                 if (!eol)
                     break;
                 const char *kn = keys[k];
                 size_t kl = strlen(kn);
-                if (strncasecmp(p, kn, kl) == 0) {
-                    char *v = p + kl;
+                if (strncasecmp(cur, kn, kl) == 0) {
+                    char *v = cur + kl;
                     while (*v == ' ')
                         v++;
                     size_t l = (size_t)(eol - v);
@@ -1196,11 +1237,88 @@ static void *ssdp_thread(void *arg)
                         break;
                     }
                 }
-                p = eol + 2;
+                cur = eol + 2;
             }
         }
         if (label)
-            labeltab_add(tab, ip, label);
+            labeltab_add(tab, ip, EV_SSDP, 0, label);
+    }
+    close(fd);
+    return NULL;
+}
+
+/* ---------------------------------------------------------------- NetBIOS */
+
+/*
+ * NBSTAT 查询：Windows 与部分 NAS 会回一张名字表，能直接拿到主机名。
+ * 广播一个包问全网，没人答就静默跳过。企业网 / 校园网常丢 ICMP，
+ * 这一层往往是唯一能说清「那台机器叫什么」的线索。
+ */
+static void *nbns_thread(void *arg)
+{
+    labeltab_t *tab = arg;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return NULL;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof one);
+
+    uint8_t q[50];
+    memset(q, 0, sizeof q);
+    q[0] = 0x82; /* 事务 id，随便取 */
+    q[1] = 0x1c;
+    q[5] = 1;  /* qdcount */
+    q[12] = 0x20; /* 名字是 32 字节的 first-level 编码 */
+    q[13] = 'C';  /* 0x2A = '*' */
+    q[14] = 'K';
+    for (int i = 15; i < 45; i++)
+        q[i] = 'A'; /* 其余补 0x00 */
+    q[46] = 0x00;
+    q[47] = 0x21; /* NBSTAT */
+    q[48] = 0x00;
+    q[49] = 0x01; /* IN */
+
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof dst);
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(137);
+    dst.sin_addr.s_addr = INADDR_BROADCAST;
+    sendto(fd, q, sizeof q, 0, (struct sockaddr *)&dst, sizeof dst);
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint8_t buf[2048];
+    while (ms_since(&t0) < 1500) {
+        struct pollfd p = {fd, POLLIN, 0};
+        int left = 1500 - ms_since(&t0);
+        if (left > 300)
+            left = 300;
+        if (poll(&p, 1, left) <= 0)
+            continue;
+        struct sockaddr_in from;
+        socklen_t fl = sizeof from;
+        ssize_t n = recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
+        if (n <= 0)
+            break;
+        /* 头 12 + 编码名 33 + type/class/ttl/rdlen 10 = 55，之后是名字表 */
+        if (n < 57)
+            continue;
+        int cnt = buf[55];
+        if (cnt < 1 || 56 + cnt * 18 > (int)n)
+            continue;
+        char name[16];
+        memcpy(name, buf + 56, 15);
+        name[15] = 0;
+        for (int k = 14; k >= 0; k--) {
+            if (name[k] == ' ' || name[k] == 0)
+                name[k] = 0;
+            else
+                break;
+        }
+        if (!name[0])
+            continue;
+        uint32_t ip = ntohl(from.sin_addr.s_addr);
+        labeltab_add(tab, ip, EV_NBNS, 0, name);
     }
     close(fd);
     return NULL;
@@ -1413,6 +1531,8 @@ static int cam_keyword(uint32_t ip, int port, char *out, size_t outsz)
 static void camera_check(host_t *h)
 {
     char ev[160];
+    /* 打印机 / NAS 的网页里也常出现 camera 字样，纯关键字命中不算证据 */
+    int web_keyword_ok = !(has_port(h, 631) || has_port(h, 9100) || has_port(h, 445));
     if (has_port(h, 554) && rtsp_probe(h->ip, 554, ev, sizeof ev) == 0)
         cam_append(h, "%s", ev);
     if (has_port(h, 8554) && rtsp_probe(h->ip, 8554, ev, sizeof ev) == 0)
@@ -1422,15 +1542,25 @@ static void camera_check(host_t *h)
     if (has_port(h, 34567))
         cam_append(h, "端口 34567（XMeye）");
 
-    static const int web[] = {80, 8080, 8000, 8001, 81, 88, 8008};
+    /*
+     * Web / ONVIF 探测不写死端口表：摄像头挂在 8081、8000、9000 甚至随机高位端口
+     * 都很常见。按「实际开放的端口」逐个试，跳掉确定不是 HTTP 的那些，最多试 3 个。
+     */
+    static const int not_web[] = {21, 22, 23, 25, 53, 110, 139, 143, 445, 515, 631,
+                                  993, 995, 1883, 3306, 3389, 5900, 62078};
     int tried = 0;
-    for (size_t i = 0; i < sizeof web / sizeof web[0] && tried < 2; i++) {
-        if (!has_port(h, web[i]))
+    for (int i = 0; i < h->nports && tried < 3; i++) {
+        int port = h->ports[i];
+        int skip = 0;
+        for (size_t k = 0; k < sizeof not_web / sizeof not_web[0]; k++)
+            if (not_web[k] == port)
+                skip = 1;
+        if (skip)
             continue;
         tried++;
-        if (onvif_probe(h->ip, web[i], ev, sizeof ev) == 0)
+        if (onvif_probe(h->ip, port, ev, sizeof ev) == 0)
             cam_append(h, "%s", ev);
-        else if (cam_keyword(h->ip, web[i], ev, sizeof ev) == 0)
+        else if (web_keyword_ok && cam_keyword(h->ip, port, ev, sizeof ev) == 0)
             cam_append(h, "%s", ev);
     }
 }
@@ -1485,13 +1615,10 @@ static void *wsd_thread(void *arg)
         char addrs[96];
         xml_grab(buf, "XAddrs>", addrs, sizeof addrs);
         char label[160];
-        if (strcasestr(buf, "NetworkVideoTransmitter"))
-            snprintf(label, sizeof label, "WS-Discovery 摄像头%s%s",
-                     addrs[0] ? " " : "", addrs);
-        else
-            snprintf(label, sizeof label, "WS-Discovery 设备%s%s",
-                     addrs[0] ? " " : "", addrs);
-        labeltab_add(tab, ip, label);
+        int nvt = strcasestr(buf, "NetworkVideoTransmitter") != NULL;
+        snprintf(label, sizeof label, "WS-Discovery %s%s%s", nvt ? "摄像头" : "设备",
+                 addrs[0] ? " " : "", addrs);
+        labeltab_add(tab, ip, EV_WSD, nvt, label);
     }
     close(fd);
     return NULL;
@@ -1924,11 +2051,13 @@ static int cp_width(const unsigned char *p)
 static void put_cell(const char *s, int width)
 {
     int used = 0;
+    /* 最后一格永远留空：否则内容刚好占满时，下一列会粘在这个值后面 */
+    int lim = width > 1 ? width - 1 : width;
     const unsigned char *p = (const unsigned char *)s;
-    while (*p && used < width) {
+    while (*p && used < lim) {
         size_t n = utf8_seq(*p);
         int w = cp_width(p);
-        if (used + w > width)
+        if (used + w > lim)
             break;
         fwrite(p, 1, n, stdout);
         used += w;
@@ -1963,28 +2092,43 @@ static int has_port(const host_t *h, int port)
     return 0;
 }
 
-static const char *device_guess(const host_t *h)
+/* 端口指纹只负责「类型」，不再兼差「存在性」；顺序从专到泛 */
+static const char *port_kind(const host_t *h)
 {
     if (has_port(h, 62078))
         return "Apple 设备";
     if (has_port(h, 5555))
         return "Android(adb)";
-    if (has_port(h, 631) || has_port(h, 9100))
+    if (has_port(h, 631) || has_port(h, 9100) || has_port(h, 515))
         return "打印机";
+    if (has_port(h, 37777) || has_port(h, 34567))
+        return "摄像头 / NVR";
+    if (has_port(h, 554) || has_port(h, 8554))
+        return "摄像头 / RTSP";
     if (has_port(h, 3389))
-        return "Windows";
+        return "Windows 远程桌面";
+    if (has_port(h, 445) || has_port(h, 139))
+        return "NAS / SMB";
     if (has_port(h, 8123) || has_port(h, 1883))
         return "智能家居";
-    if (has_port(h, 445) || has_port(h, 139))
-        return "NAS/SMB";
-    if (has_port(h, 554) || has_port(h, 8554) || has_port(h, 37777) || has_port(h, 34567))
-        return "摄像头 / NVR";
-    if (h->ttl > 200)
-        return "网络设备";
-    if (h->ttl > 100 && h->ttl <= 128)
-        return "Windows";
-    if (has_port(h, 22) || has_port(h, 80) || has_port(h, 443))
-        return "Linux / IoT";
+    if (has_port(h, 53))
+        return "DNS";
+    if (has_port(h, 22))
+        return "SSH";
+    if (has_port(h, 80) || has_port(h, 443) || has_port(h, 8080) || has_port(h, 8443))
+        return "Web 设备";
+    return "";
+}
+
+static const char *device_guess(const host_t *h)
+{
+    const char *k = port_kind(h);
+    if (*k)
+        return k;
+    if (h->ev & (EV_MDNS | EV_SSDP | EV_WSD | EV_NBNS))
+        return "服务发现"; /* 身份见 svc，端口没开 */
+    /* TTL 不再用来猜类型：实测同一网段里 255 的既有 AP/机顶盒也有真机，
+     * 猜出来的「网络设备」只是噪声。类型说不准就留空，靠证据说明。 */
     return "";
 }
 
@@ -2010,25 +2154,50 @@ static int term_width(void)
     return 80;
 }
 
-/* 一台设备的说明串：识别 + MAC/厂商 + Web 指纹 + mDNS 标签 */
+static void note_app(char *note, size_t cap, const char *text)
+{
+    if (!text || !*text)
+        return;
+    size_t used = strlen(note);
+    if (used + 4 >= cap)
+        return;
+    snprintf(note + used, cap - used, "%s%s", used ? " · " : "", text);
+}
+
+/*
+ * 说明串的组装顺序 = 可信度顺序：可疑标记 → 类型 → 自报身份 → MAC/厂商 →
+ * Web 指纹 → 服务标签 → 证据强度。窄屏截断时先丢的是最弱的尾巴。
+ */
 static void host_note(const host_t *h, char *note, size_t cap)
 {
     note[0] = 0;
-    const char *g = device_guess(h);
-    if (*g)
-        snprintf(note, cap, "%s", g);
-    if (h->mac[0])
-        snprintf(note + strlen(note), cap - strlen(note), "%sMAC %s%s%s",
-                 note[0] ? " · " : "", h->mac, h->vendor[0] ? " " : "", h->vendor);
-    if (h->banner[0])
-        snprintf(note + strlen(note), cap - strlen(note), "%s%s",
-                 note[0] ? " · " : "", h->banner);
+    if (h->suspect == 2)
+        note_app(note, cap, "⚠ 疑似网关代答");
+    note_app(note, cap, device_guess(h));
+    if (h->svc[0]) {
+        char tmp[120];
+        snprintf(tmp, sizeof tmp, "「%.80s」", h->svc);
+        note_app(note, cap, tmp);
+    }
+    if (h->mac[0]) {
+        char tmp[96];
+        if (h->vendor[0])
+            snprintf(tmp, sizeof tmp, "MAC %s %s", h->mac, h->vendor);
+        else
+            snprintf(tmp, sizeof tmp, "MAC %s", h->mac);
+        note_app(note, cap, tmp);
+    }
+    note_app(note, cap, h->banner);
     if (h->nlabels)
-        snprintf(note + strlen(note), cap - strlen(note), "%s%s",
-                 note[0] ? " · " : "", h->labels[0]);
-    if (!h->has_icmp)
-        snprintf(note + strlen(note), cap - strlen(note), "%s[仅端口响应]",
-                 note[0] ? " · " : "");
+        note_app(note, cap, h->labels[0]);
+    /* 有端口拒绝但没有开放端口：设备在，只是 ICMP 被挡、端口全关 */
+    if (h->nports == 0 && h->nrefused > 0)
+        note_app(note, cap, "端口拒绝(RST)");
+    /* 证据强度放最后：纯 ICMP 要明确说出来，别让人当成已确认的设备 */
+    if (h->suspect == 1)
+        note_app(note, cap, "仅 ICMP");
+    if (!(h->ev & EV_ICMP) && (h->ev & EV_L3))
+        note_app(note, cap, "ICMP 不回");
 }
 
 static void render(host_t **alive, int n, const char *own, const char *subnet, int probed,
@@ -2039,10 +2208,27 @@ static void render(host_t **alive, int n, const char *own, const char *subnet, i
         W = 200;
     int wide = W >= 100;
 
-    if (wide)
-        printf("本机 %s  网段 %s  在线 %d/%d  %.1fs\n\n", own, subnet, n, probed, elapsed);
-    else
-        printf("本机 %s\n网段 %s  在线 %d/%d  %.1fs\n\n", own, subnet, n, probed, elapsed);
+    int nsus = 0, nweak = 0;
+    for (int i = 0; i < n; i++) {
+        if (alive[i]->suspect == 2)
+            nsus++;
+        else if (alive[i]->suspect == 1)
+            nweak++;
+    }
+
+    if (wide) {
+        if (nsus + nweak > 0)
+            printf("本机 %s  网段 %s  在线 %d/%d（弱证据 %d）  %.1fs\n\n", own, subnet, n,
+                   probed, nsus + nweak, elapsed);
+        else
+            printf("本机 %s  网段 %s  在线 %d/%d  %.1fs\n\n", own, subnet, n, probed,
+                   elapsed);
+    } else {
+        printf("本机 %s\n网段 %s  在线 %d/%d  %.1fs\n", own, subnet, n, probed, elapsed);
+        if (nsus + nweak > 0)
+            printf("弱证据 %d 台（只有 ICMP，未确认）\n", nsus + nweak);
+        printf("\n");
+    }
 
     const int WIP = 15, WNAME = 22, WRTT = 8, WPORT = 23;
     int wnote = W - (WIP + WNAME + WRTT + WPORT);
@@ -2120,6 +2306,12 @@ static void render(host_t **alive, int n, const char *own, const char *subnet, i
         }
     }
 
+    if (nsus > 0) {
+        printf("注意：%d 台的 ICMP 回包与网关同源（TTL / 延迟一致），可能是网关代答，别当成设备。\n",
+               nsus);
+        printf("\n");
+    }
+
     int ncam = 0;
     for (int i = 0; i < n; i++)
         if (alive[i]->is_cam)
@@ -2188,11 +2380,13 @@ static int write_json(const char *path, host_t **alive, int n, const char *own,
         json_escape(h->name, en, sizeof en);
         json_escape(h->banner, eb, sizeof eb);
 
-        char ports[512] = "";
+        /* 端口串最坏情况：MAXPORTS 个 5 位数 + 分隔符，按上限开，别用固定 512 */
+        char ports[MAXPORTS * 7 + 8] = "";
         for (int k = 0; k < h->nports; k++) {
             char tmp[16];
             snprintf(tmp, sizeof tmp, "%s%d", k ? ", " : "", h->ports[k]);
-            strcat(ports, tmp);
+            if (strlen(ports) + strlen(tmp) < sizeof ports - 1)
+                strcat(ports, tmp);
         }
         char labels[1024] = "";
         for (int k = 0; k < h->nlabels; k++) {
@@ -2202,18 +2396,34 @@ static int write_json(const char *path, host_t **alive, int n, const char *own,
             strcat(labels, el);
             strcat(labels, "\"");
         }
-        char ec[520];
+        char ec[520], es[200], evs[160] = "";
+        static const struct {
+            unsigned bit;
+            const char *name;
+        } evn[] = {{EV_ICMP, "icmp"},   {EV_ARP, "arp"},    {EV_RST, "rst"},
+                   {EV_TCP, "tcp"},     {EV_MDNS, "mdns"},  {EV_SSDP, "ssdp"},
+                   {EV_WSD, "wsd"},     {EV_NBNS, "nbstat"}, {EV_HTTP, "http"}};
+        for (size_t k = 0; k < sizeof evn / sizeof evn[0]; k++) {
+            if (!(h->ev & evn[k].bit))
+                continue;
+            if (evs[0])
+                strcat(evs, ", ");
+            strcat(evs, "\"");
+            strcat(evs, evn[k].name);
+            strcat(evs, "\"");
+        }
         json_escape(h->cam, ec, sizeof ec);
+        json_escape(h->svc, es, sizeof es);
         fprintf(f,
-                "    {\"ip\": \"%s\", \"name\": \"%s\", \"alive_by\": [\"%s\"%s%s], "
-                "\"rtt_ms\": %.2f, \"ttl\": %d, \"ports\": [%s], \"banner\": \"%s\", "
-                "\"labels\": [%s], \"guess\": \"%s\", \"mac\": \"%s\", \"vendor\": \"%s\", "
+                "    {\"ip\": \"%s\", \"name\": \"%s\", \"service\": \"%s\", "
+                "\"evidence\": [%s], \"suspect\": \"%s\", \"rtt_ms\": %.2f, \"ttl\": %d, "
+                "\"ports\": [%s], \"refused\": %d, \"banner\": \"%s\", \"labels\": [%s], "
+                "\"guess\": \"%s\", \"mac\": \"%s\", \"vendor\": \"%s\", "
                 "\"camera\": %s, \"camera_evidence\": \"%s\"}%s\n",
-                ipbuf, en, h->has_icmp ? "icmp" : "tcp",
-                h->nports ? ", \"tcp\"" : "", "",
-                h->rtt, h->ttl, ports, eb, labels, device_guess(h),
-                h->mac, h->vendor, h->is_cam ? "true" : "false", ec,
-                i + 1 < n ? "," : "");
+                ipbuf, en, es, evs,
+                h->suspect == 2 ? "gateway_proxy" : (h->suspect == 1 ? "icmp_only" : "none"),
+                h->rtt, h->ttl, ports, h->nrefused, eb, labels, device_guess(h), h->mac,
+                h->vendor, h->is_cam ? "true" : "false", ec, i + 1 < n ? "," : "");
     }
     fprintf(f, "  ]");
     if (g_naps > 0) {
@@ -2246,13 +2456,21 @@ static int g_nt;
 static host_t *g_slots;
 static int g_cursor;
 static int g_timeout_ms = 700;
-static int g_live_ms = 400;
+static int g_live_ms = 300;
 static const int *g_ports;
 static int g_nports;
 static int g_no_http;
 static int g_no_cam;
+static int g_no_nbns;
 
-static void *ping_worker(void *arg)
+/* 网关基线。g_gw = 0 表示没拿到，此时完全不做「疑似代答」推断 */
+static uint32_t g_gw;
+static double g_gw_rtt;
+static int g_gw_ttl;
+static char g_gw_mac[20];
+
+/* 阶段一：ICMP 只记证据，不下结论 —— 代理 ARP 也能替别人回包 */
+static void *icmp_worker(void *arg)
 {
     (void)arg;
     for (;;) {
@@ -2262,8 +2480,7 @@ static void *ping_worker(void *arg)
         double rtt;
         int ttl;
         if (ping_once(g_t[i], &rtt, &ttl)) {
-            g_slots[i].has_icmp = 1;
-            g_slots[i].alive = 1;
+            g_slots[i].ev |= EV_ICMP;
             g_slots[i].rtt = rtt;
             g_slots[i].ttl = ttl;
         }
@@ -2271,28 +2488,45 @@ static void *ping_worker(void *arg)
     return NULL;
 }
 
-static void *live_worker(void *arg)
+/*
+ * 阶段二：端口。**所有目标都扫**，不再只扫 ping 得通的 ——
+ * 校园网 / 企业网 / 开了防火墙的家用设备常常整段丢 ICMP，
+ * 只靠 ping 会把它们全漏掉。回 RST 的端口单独计数，那是真机的硬证据。
+ */
+static void *port_worker(void *arg)
 {
     (void)arg;
     for (;;) {
         int i = __atomic_fetch_add(&g_cursor, 1, __ATOMIC_RELAXED);
         if (i >= g_nt)
             break;
-        if (g_slots[i].alive)
-            continue;
-        int openp[16];
-        int n = scan_ports(g_t[i], LIVE_PORTS, NLIVE, g_live_ms, openp, 16);
-        if (n > 0) {
-            g_slots[i].alive = 1;
-            g_slots[i].nports = n;
-            for (int k = 0; k < n; k++)
-                g_slots[i].ports[k] = openp[k];
+        host_t *h = &g_slots[i];
+        int dn = g_nports;
+        int to = g_timeout_ms;
+        if (!(h->ev & EV_ICMP)) {
+            to = g_live_ms;
+            if (dn > 384) /* -p 1-65535 这种发现阶段只取前 384 个，别把整段拖死 */
+                dn = 384;
         }
+        int openp[MAXPORTS];
+        int refused = 0;
+        int n = scan_ports(g_t[i], g_ports, dn, to, openp, MAXPORTS, &refused);
+        h->ip = g_t[i];
+        h->nrefused = refused;
+        if (n > 0) {
+            h->nports = n;
+            memcpy(h->ports, openp, (size_t)n * sizeof openp[0]);
+            h->ev |= EV_TCP;
+        }
+        if (refused > 0)
+            h->ev |= EV_RST;
+        h->alive = h->ev != 0;
     }
     return NULL;
 }
 
-static void *full_worker(void *arg)
+/* 阶段三：取证。只对已有证据的主机做，端口已经在上一阶段扫完 */
+static void *enrich_worker(void *arg)
 {
     (void)arg;
     for (;;) {
@@ -2303,16 +2537,16 @@ static void *full_worker(void *arg)
         if (!h->alive)
             continue;
         h->ip = g_t[i];
-        if (h->nports == 0 && g_nports > 0)
-            h->nports = scan_ports(g_t[i], g_ports, g_nports, g_timeout_ms, h->ports, MAXPORTS);
         rdns(g_t[i], h->name, sizeof h->name);
         if (!g_no_http) {
             for (int k = 0; k < NHTTP; k++) {
                 if (!has_port(h, HTTP_PORTS[k].port))
                     continue;
                 if (http_banner(g_t[i], HTTP_PORTS[k].port, HTTP_PORTS[k].tls, h->banner,
-                                sizeof h->banner) == 0)
+                                sizeof h->banner) == 0) {
+                    h->ev |= EV_HTTP;
                     break;
+                }
             }
         }
         if (!g_no_cam)
@@ -2365,10 +2599,12 @@ static void usage(void)
            "  -p, --ports <列表>           如 1-1024 或 22,80,443（默认内置 32 个常用端口）\n"
            "  -w, --wifi                   同时勘查周边无线（SSID/加密/信号/信道）\n"
            "      --wifi-only              只勘查无线，不扫局域网\n"
-           "      --timeout <ms>           单个 TCP 连接超时（默认 700）\n"
+           "      --timeout <ms>           有 ICMP 应答的主机：单端口连接超时（默认 700）\n"
+           "      --live-timeout <ms>      无 ICMP 应答的主机：发现阶段端口超时（默认 300）\n"
            "      --threads <n>            并发主机数（默认 64）\n"
            "      --no-mdns                跳过 mDNS\n"
            "      --no-ssdp                跳过 SSDP/UPnP\n"
+           "      --no-nbns                跳过 NetBIOS 名称查询\n"
            "      --no-http                不抓 Web 标题 / Server 头\n"
            "      --no-cam                 跳过摄像头指纹（WS-Discovery/RTSP/ONVIF）\n"
            "      --json <路径>            导出 JSON\n"
@@ -2393,9 +2629,11 @@ int main(int argc, char **argv)
         {"wifi", no_argument, NULL, 'w'},
         {"wifi-only", no_argument, NULL, 7},
         {"timeout", required_argument, NULL, 1},
+        {"live-timeout", required_argument, NULL, 10},
         {"threads", required_argument, NULL, 2},
         {"no-mdns", no_argument, NULL, 3},
         {"no-ssdp", no_argument, NULL, 4},
+        {"no-nbns", no_argument, NULL, 9},
         {"no-http", no_argument, NULL, 5},
         {"no-cam", no_argument, NULL, 8},
         {"json", required_argument, NULL, 6},
@@ -2411,6 +2649,8 @@ int main(int argc, char **argv)
         case 'w': do_wifi = 1; break;
         case 7: do_wifi = 1; wifi_only = 1; break;
         case 1: g_timeout_ms = atoi(optarg); break;
+        case 10: g_live_ms = atoi(optarg); break;
+        case 9: g_no_nbns = 1; break;
         case 2: threads = atoi(optarg); break;
         case 3: no_mdns = 1; break;
         case 4: no_ssdp = 1; break;
@@ -2423,6 +2663,8 @@ int main(int argc, char **argv)
     }
     if (g_timeout_ms < 50)
         g_timeout_ms = 50;
+    if (g_live_ms < 50)
+        g_live_ms = 50;
     if (threads < 1)
         threads = 1;
 
@@ -2520,19 +2762,40 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    static labeltab_t mtab, stab, ctab;
-    pthread_t t_mdns, t_ssdp, t_wsd;
-    int has_mdns = 0, has_ssdp = 0, has_wsd = 0;
+    static labeltab_t mtab, stab, ctab, ntab;
+    pthread_t t_mdns, t_ssdp, t_wsd, t_nbns;
+    int has_mdns = 0, has_ssdp = 0, has_wsd = 0, has_nbns = 0;
+
+    /*
+     * 网关基线：不同网络里网关未必是 .1，而 Android 又读不到路由表
+     * （netlink 被 SELinux 挡住）。所以这里只是「试一下 .1」——
+     * 不通就把 g_gw 清 0，后面一个「疑似代答」都不标。宁可不判，也不误判。
+     */
+    g_gw = (targets[0] & 0xFFFFFF00u) | 1u;
+    {
+        double gw_rtt = 0;
+        int gw_ttl = 0;
+        if (ping_once(g_gw, &gw_rtt, &gw_ttl)) {
+            g_gw_rtt = gw_rtt;
+            g_gw_ttl = gw_ttl;
+            arp_lookup(g_gw, g_gw_mac, sizeof g_gw_mac); /* 只有 Linux 拿得到 */
+        } else {
+            g_gw = 0;
+        }
+    }
+
     if (!no_mdns && pthread_create(&t_mdns, NULL, mdns_thread, &mtab) == 0)
         has_mdns = 1;
     if (!no_ssdp && pthread_create(&t_ssdp, NULL, ssdp_thread, &stab) == 0)
         has_ssdp = 1;
     if (!g_no_cam && pthread_create(&t_wsd, NULL, wsd_thread, &ctab) == 0)
         has_wsd = 1;
+    if (!g_no_nbns && pthread_create(&t_nbns, NULL, nbns_thread, &ntab) == 0)
+        has_nbns = 1;
 
-    run_workers(ping_worker, threads, targets, nt, slots);
-    run_workers(live_worker, threads, targets, nt, slots);
-    run_workers(full_worker, threads, targets, nt, slots);
+    run_workers(icmp_worker, threads, targets, nt, slots);
+    run_workers(port_worker, threads, targets, nt, slots);
+    run_workers(enrich_worker, threads, targets, nt, slots);
 
     if (has_mdns)
         pthread_join(t_mdns, NULL);
@@ -2540,6 +2803,8 @@ int main(int argc, char **argv)
         pthread_join(t_ssdp, NULL);
     if (has_wsd)
         pthread_join(t_wsd, NULL);
+    if (has_nbns)
+        pthread_join(t_nbns, NULL);
 
     host_t **alive = malloc((size_t)nt * sizeof *alive);
     if (!alive) {
@@ -2547,32 +2812,119 @@ int main(int argc, char **argv)
         free(targets);
         return 2;
     }
+    /*
+     * 合并：监听线程收到的应答既是身份（svc），也是「这台机器确实存在」的独立证据 ——
+     * 它比 ICMP 硬得多，代理 ARP 不会替别人答 mDNS / SSDP / WS-D / NetBIOS。
+     */
     int n = 0;
     for (int i = 0; i < nt; i++) {
-        if (!slots[i].alive)
+        host_t *h = &slots[i];
+        if (!h->alive)
             continue;
-        slots[i].ip = targets[i];
-        for (int k = 0; k < mtab.n; k++)
-            if (mtab.v[k].ip == slots[i].ip)
-                host_label_add(&slots[i], mtab.v[k].text);
-        for (int k = 0; k < stab.n; k++)
-            if (stab.v[k].ip == slots[i].ip)
-                host_label_add(&slots[i], stab.v[k].text);
-        for (int k = 0; k < ctab.n; k++)
-            if (ctab.v[k].ip == slots[i].ip)
-                cam_append(&slots[i], "%s", ctab.v[k].text);
-        if (!slots[i].name[0] && slots[i].nlabels)
-            snprintf(slots[i].name, sizeof slots[i].name, "%s", slots[i].labels[0]);
-        alive[n++] = &slots[i];
-    }
-    qsort(alive, (size_t)n, sizeof *alive, cmp_host);
+        h->ip = targets[i];
 
-    /* Linux：ping 过之后 /proc/net/arp 里就有条目，补 MAC 再查厂商；Android 上会静默跳过 */
-    for (int i = 0; i < n; i++) {
-        if (arp_lookup(alive[i]->ip, alive[i]->mac, sizeof alive[i]->mac) == 0)
-            snprintf(alive[i]->vendor, sizeof alive[i]->vendor, "%s",
-                     oui_lookup(alive[i]->mac));
+        for (int k = 0; k < mtab.n; k++) {
+            if (mtab.v[k].ip != h->ip)
+                continue;
+            h->ev |= mtab.v[k].ev;
+            host_label_add(h, mtab.v[k].text);
+            if (!h->svc[0])
+                copy_str(h->svc, sizeof h->svc, mtab.v[k].text);
+        }
+        for (int k = 0; k < stab.n; k++) {
+            if (stab.v[k].ip != h->ip)
+                continue;
+            h->ev |= stab.v[k].ev;
+            host_label_add(h, stab.v[k].text);
+            if (!h->svc[0])
+                copy_str(h->svc, sizeof h->svc, stab.v[k].text);
+        }
+        for (int k = 0; k < ntab.n; k++) {
+            if (ntab.v[k].ip != h->ip)
+                continue;
+            h->ev |= ntab.v[k].ev;
+            host_label_add(h, ntab.v[k].text);
+            if (!h->svc[0])
+                copy_str(h->svc, sizeof h->svc, ntab.v[k].text);
+        }
+        for (int k = 0; k < ctab.n; k++) {
+            if (ctab.v[k].ip != h->ip)
+                continue;
+            h->ev |= ctab.v[k].ev;
+            /* 只有声明 NetworkVideoTransmitter 的才是摄像头，其余当普通设备 */
+            if (ctab.v[k].nvt) {
+                cam_append(h, "%s", ctab.v[k].text);
+            } else {
+                host_label_add(h, ctab.v[k].text);
+                if (!h->svc[0])
+                    copy_str(h->svc, sizeof h->svc, ctab.v[k].text);
+            }
+        }
+
+        /* Linux：ARP 表里有 MAC 就是硬证据；Android 上读不到，静默跳过 */
+        if (arp_lookup(h->ip, h->mac, sizeof h->mac) == 0) {
+            h->ev |= EV_ARP;
+            copy_str(h->vendor, sizeof h->vendor, oui_lookup(h->mac));
+        }
+
+        if (!h->name[0]) {
+            if (h->svc[0])
+                copy_str(h->name, sizeof h->name, h->svc);
+            else if (h->nlabels)
+                copy_str(h->name, sizeof h->name, h->labels[0]);
+            else if (h->banner[0]) {
+                /* 还空着就用网页标题 —— 比让名称列留 "-" 有用 */
+                const char *a = strstr(h->banner, "「");
+                const char *b = a ? strstr(a, "」") : NULL;
+                if (a && b && b > a + 3) {
+                    size_t len = (size_t)(b - (a + 3));
+                    if (len > sizeof h->name - 1)
+                        len = sizeof h->name - 1;
+                    memcpy(h->name, a + 3, len);
+                    h->name[len] = 0;
+                }
+            }
+        }
+        alive[n++] = h;
     }
+
+    /*
+     * 网络级推断：代理 ARP 的网关会替网段里任何空 IP 回 ICMP，而且回包的 TTL 与
+     * 延迟跟网关自己一模一样。只有当这种「像网关」的主机成批出现（≥5 台，且占
+     * 纯 ICMP 主机的 3/4 以上）才认定 —— 在真密集网络里不会误伤。
+     */
+    int icmp_only = 0, gw_like = 0;
+    for (int i = 0; i < n; i++) {
+        host_t *h = alive[i];
+        if (h->ev == EV_ICMP)
+            icmp_only++;
+        if (h->ev & EV_L3)
+            continue;
+        if (!g_gw || h->ip == g_gw)
+            continue;
+        double d = h->rtt - g_gw_rtt;
+        if (d < 0)
+            d = -d;
+        if (h->ttl == g_gw_ttl && d <= 1.5)
+            gw_like++;
+    }
+    int proxy = g_gw && gw_like >= 5 && gw_like * 4 >= (icmp_only ? icmp_only : 1) * 3;
+
+    for (int i = 0; i < n; i++) {
+        host_t *h = alive[i];
+        if (h->ev & EV_L3)
+            continue; /* 有独立证据，不算弱证据 */
+        if (h->ip == g_gw)
+            continue; /* 网关自己当然「像网关」 */
+        if (g_gw_mac[0] && h->mac[0] && strcasecmp(h->mac, g_gw_mac) == 0)
+            h->suspect = 2; /* MAC 与网关相同：铁证 */
+        else if (proxy)
+            h->suspect = 2;
+        else
+            h->suspect = 1;
+    }
+
+    qsort(alive, (size_t)n, sizeof *alive, cmp_host);
 
     double elapsed = now_sec() - t_start;
     render(alive, n, own, subnet, nt, elapsed);
@@ -2598,6 +2950,7 @@ int main(int argc, char **argv)
     free(mtab.v);
     free(stab.v);
     free(ctab.v);
+    free(ntab.v);
     free(alive);
     free(slots);
     free(targets);
