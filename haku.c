@@ -458,6 +458,25 @@ static int scan_ports(uint32_t ip, const int *ports, int nports, int timeout_ms,
     return found;
 }
 
+/* 网关常把 PTR 填成 IP 本身或 host-10-0-0-5 模板，这种不算名字 */
+static int name_is_junk(uint32_t ip, const char *nm)
+{
+    if (!nm || !*nm)
+        return 1;
+    char dotted[16], dashed[20];
+    u32_to_ip(ip, dotted);
+    snprintf(dashed, sizeof dashed, "%u-%u-%u-%u", (ip >> 24) & 255u, (ip >> 16) & 255u,
+             (ip >> 8) & 255u, ip & 255u);
+    if (strcmp(nm, dotted) == 0 || strcmp(nm, dashed) == 0)
+        return 1;
+    if (strstr(nm, dotted) || strstr(nm, dashed))
+        return 1;
+    for (const char *p = nm; *p; p++)
+        if (!isdigit((unsigned char)*p) && *p != '.' && *p != '-')
+            return 0;
+    return 1;
+}
+
 static void rdns(uint32_t ip, char *out, size_t n)
 {
     out[0] = 0;
@@ -467,12 +486,8 @@ static void rdns(uint32_t ip, char *out, size_t n)
     sa.sin_addr.s_addr = htonl(ip);
     char host[NI_MAXHOST];
     if (getnameinfo((struct sockaddr *)&sa, sizeof sa, host, sizeof host, NULL, 0,
-                    NI_NAMEREQD) == 0) {
-        /* 不少网关把 PTR 直接填成点分十进制，NI_NAMEREQD 拦不住，会跟 IP 列重复 */
-        struct in_addr tmp;
-        if (inet_pton(AF_INET, host, &tmp) != 1)
-            copy_str(out, n, host);
-    }
+                    NI_NAMEREQD) == 0 && !name_is_junk(ip, host))
+        copy_str(out, n, host);
 }
 
 /* ---------------------------------------------------------------- MAC / 厂商 */
@@ -837,13 +852,22 @@ enum {
     EV_WSD = 1u << 6,
     EV_NBNS = 1u << 7,
     EV_HTTP = 1u << 8,
+    EV_RDNS = 1u << 9, /* 网关 PTR 回了真名字 —— 它记着这个地址的 DHCP 租约 */
+    EV_LLMNR = 1u << 10,
 };
 /* 除 ICMP 以外都算「有独立证据」：代理 ARP 不会替别人应答这些 */
-#define EV_L3 (EV_ARP | EV_RST | EV_TCP | EV_MDNS | EV_SSDP | EV_WSD | EV_NBNS | EV_HTTP)
+#define EV_L3                                                                          \
+    (EV_ARP | EV_RST | EV_TCP | EV_MDNS | EV_SSDP | EV_WSD | EV_NBNS | EV_HTTP |        \
+     EV_RDNS | EV_LLMNR)
 
 /* 并发阶段共享的目标表；监听线程（nbns 单播）也要用，所以定义在标签表这一层 */
 static uint32_t *g_t;
 static int g_nt;
+
+/* 网关 PTR 的普查结果：答了但只把 IP 回过来的网关，0 = 没遇到这种 */
+static uint32_t g_ptr_dumb;
+static int g_ptr_asked;
+static int g_ptr_junk;
 
 typedef struct {
     uint32_t ip;
@@ -868,6 +892,8 @@ typedef struct {
     int nrefused; /* 回 RST 的端口数：真机铁证 */
     int ports[MAXPORTS];
     char name[128];
+    int name_src;    /* 1 设备自报 · 2 路由器租约（PTR/LLMNR）· 3 网页标题 · 0 无 */
+    char pname[128]; /* 租约名：手机的型号名（JEF-AN00 之类）通常只在这儿 */
     char svc[96]; /* 设备自报的身份：mDNS 实例 / SSDP friendlyName / NetBIOS 名 */
     char banner[160];
     int nlabels;
@@ -1388,6 +1414,7 @@ static void fit_copy(char *dst, size_t cap, const char *src, int width)
     dst[o] = 0;
 }
 
+static void cam_append(host_t *h, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void cam_append(host_t *h, const char *fmt, ...)
 {
     va_list ap;
@@ -1673,6 +1700,165 @@ static void unicast_mdns(host_t *slots, int nt, labeltab_t *tab)
     close(fd);
     mdns_emit(rrs, nrr, tab);
     free(rrs);
+}
+
+/* ---------------------------------------------------------------- 反向 DNS */
+
+/*
+ * 手机名不在手机上（Android 不跑 mDNS/NetBIOS/LLMNR），在路由器的 DHCP 租约里：
+ * 手机连网时把型号报给 DHCP，dnsmasq 再用它答 PTR。这里直问网关 53，不走 getnameinfo
+ * —— Android 开了 Private DNS 会把查询送去公网。
+ */
+static uint32_t ptr_qname_ip(const uint8_t *buf, int len)
+{
+    char q[128];
+    if (len < 12 || dns_read_name(buf, len, 12, q, sizeof q) < 0)
+        return 0;
+    unsigned a, b, c, d;
+    char tail[16];
+    if (sscanf(q, "%u.%u.%u.%u.%15s", &a, &b, &c, &d, tail) != 5)
+        return 0;
+    if (a > 255 || b > 255 || c > 255 || d > 255 || strcasecmp(tail, "in-addr.arpa") != 0)
+        return 0;
+    return (d << 24) | (c << 16) | (b << 8) | a; /* arpa 是反序的 */
+}
+
+static int build_ptr_query(uint8_t *buf, size_t cap, uint32_t ip)
+{
+    char name[48];
+    snprintf(name, sizeof name, "%u.%u.%u.%u.in-addr.arpa", ip & 255u, (ip >> 8) & 255u,
+             (ip >> 16) & 255u, (ip >> 24) & 255u);
+    int n = build_query(buf, cap, name, 12);
+    if (n > 12)
+        buf[2] = 0x01; /* RD：网关不是权威服务器 */
+    return n;
+}
+
+/* 归属靠问题段里的 arpa 名反推，不靠事务 ID —— 乱序或原样回包都不串台 */
+static int ptr_answer(const uint8_t *buf, int n, uint32_t *ip, char *out, size_t outsz)
+{
+    if (n < 12 || (buf[3] & 0x0F) != 0)
+        return 0; /* NXDOMAIN / REFUSED */
+    int qd = (buf[4] << 8) | buf[5];
+    int an = (buf[6] << 8) | buf[7];
+    *ip = ptr_qname_ip(buf, n);
+    if (!*ip || an <= 0)
+        return 0;
+    int off = 12;
+    for (int i = 0; i < qd; i++) {
+        char qn[128];
+        off = dns_read_name(buf, n, off, qn, sizeof qn);
+        if (off < 0 || off + 4 > n)
+            return 0;
+        off += 4;
+    }
+    for (int i = 0; i < an; i++) {
+        char owner[128];
+        off = dns_read_name(buf, n, off, owner, sizeof owner);
+        if (off < 0 || off + 10 > n)
+            return 0;
+        int type = (buf[off] << 8) | buf[off + 1];
+        int rdlen = (buf[off + 8] << 8) | buf[off + 9];
+        int rd = off + 10;
+        if (rd + rdlen > n)
+            return 0;
+        if (type == 12 && rdlen > 1 && dns_read_name(buf, n, rd, out, outsz) > 0) {
+            size_t l = strlen(out);
+            while (l && out[l - 1] == '.')
+                out[--l] = 0;
+            return 1;
+        }
+        off = rd + rdlen;
+    }
+    return 0;
+}
+
+static host_t *slot_at(uint32_t ip)
+{
+    for (int i = 0; i < g_nt; i++)
+        if (g_slots[i].alive && g_t[i] == ip)
+            return &g_slots[i];
+    return NULL;
+}
+
+/* 整段一次问完再统一收窗口；逐台问会让不答 PTR 的网关把时间乘上 254。
+ * unicast_all=1：每台各问一个（LLMNR）；0：全问同一台服务器（网关 DNS）。 */
+static void rdns_batch(host_t *slots, int nt, unsigned evbit, int window_ms, int unicast_all,
+                       uint32_t server, uint16_t port)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return;
+    int asked = 0;
+    for (int i = 0; i < nt; i++) {
+        if (!slots[i].alive || slots[i].pname[0])
+            continue;
+        struct sockaddr_in dst;
+        memset(&dst, 0, sizeof dst);
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(port);
+        dst.sin_addr.s_addr = htonl(unicast_all ? g_t[i] : server);
+        uint8_t q[64];
+        int qn = build_ptr_query(q, sizeof q, g_t[i]);
+        if (qn <= 0)
+            continue;
+        if (sendto(fd, q, (size_t)qn, 0, (struct sockaddr *)&dst, sizeof dst) < 0)
+            continue;
+        asked++;
+    }
+    if (asked == 0) {
+        close(fd);
+        return;
+    }
+
+    int junk = 0;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint8_t buf[2048];
+    while (ms_since(&t0) < window_ms) {
+        struct pollfd p = {fd, POLLIN, 0};
+        int left = window_ms - ms_since(&t0);
+        if (left > 250)
+            left = 250;
+        if (poll(&p, 1, left) <= 0)
+            continue;
+        ssize_t n = recv(fd, buf, sizeof buf, 0);
+        if (n <= 0)
+            break;
+        uint32_t ip = 0;
+        char nm[128] = "";
+        if (!ptr_answer(buf, (int)n, &ip, nm, sizeof nm))
+            continue;
+        host_t *h = slot_at(ip);
+        if (!h)
+            continue;
+        if (name_is_junk(ip, nm)) {
+            junk++;
+            continue;
+        }
+        if (!h->pname[0]) {
+            copy_str(h->pname, sizeof h->pname, nm);
+            h->ev |= evbit;
+        }
+    }
+    close(fd);
+
+    if (unicast_all)
+        return; /* LLMNR 不回话是常态，不据此下判断 */
+    g_ptr_asked += asked;
+    g_ptr_junk += junk;
+    if (!g_ptr_dumb && junk * 2 >= asked && junk >= 1)
+        g_ptr_dumb = server;
+}
+
+static void ptr_batch(host_t *slots, int nt, uint32_t server, uint16_t port)
+{
+    rdns_batch(slots, nt, EV_RDNS, 1200, 0, server, port);
+}
+
+static void llmnr_batch(host_t *slots, int nt)
+{
+    rdns_batch(slots, nt, EV_LLMNR, 800, 1, 0, 5355);
 }
 
 /* WS-Discovery：海康/大华这类 ONVIF 摄像头会回 ProbeMatch */
@@ -2423,6 +2609,14 @@ static void render(host_t **alive, int n, const char *own, const char *subnet, i
         printf("\n");
     }
 
+    if (g_ptr_dumb) {
+        char gw[16];
+        u32_to_ip(g_ptr_dumb, gw);
+        printf("注：网关 %s 没存设备名（PTR 只把 IP 或 host-x 这类模板回你），所以空名字不是"
+               "漏采 —— 手机名只能看路由器后台的客户端列表。\n", gw);
+        printf("\n");
+    }
+
     int ncam = 0;
     for (int i = 0; i < n; i++)
         if (alive[i]->is_cam)
@@ -2511,9 +2705,10 @@ static int write_json(const char *path, host_t **alive, int n, const char *own,
         static const struct {
             unsigned bit;
             const char *name;
-        } evn[] = {{EV_ICMP, "icmp"},   {EV_ARP, "arp"},    {EV_RST, "rst"},
-                   {EV_TCP, "tcp"},     {EV_MDNS, "mdns"},  {EV_SSDP, "ssdp"},
-                   {EV_WSD, "wsd"},     {EV_NBNS, "nbstat"}, {EV_HTTP, "http"}};
+        } evn[] = {{EV_ICMP, "icmp"},   {EV_ARP, "arp"},     {EV_RST, "rst"},
+                   {EV_TCP, "tcp"},     {EV_MDNS, "mdns"},   {EV_SSDP, "ssdp"},
+                   {EV_WSD, "wsd"},     {EV_NBNS, "nbstat"}, {EV_HTTP, "http"},
+                   {EV_RDNS, "rdns"},   {EV_LLMNR, "llmnr"}};
         for (size_t k = 0; k < sizeof evn / sizeof evn[0]; k++) {
             if (!(h->ev & evn[k].bit))
                 continue;
@@ -2525,13 +2720,18 @@ static int write_json(const char *path, host_t **alive, int n, const char *own,
         }
         json_escape(h->cam, ec, sizeof ec);
         json_escape(h->svc, es, sizeof es);
+        const char *nsrc = h->name_src == 1   ? "device"
+                           : h->name_src == 2 ? "router"
+                           : h->name_src == 3 ? "http"
+                                              : "none";
         fprintf(f,
-                "    {\"ip\": \"%s\", \"name\": \"%s\", \"service\": \"%s\", "
+                "    {\"ip\": \"%s\", \"name\": \"%s\", \"name_source\": \"%s\", "
+                "\"service\": \"%s\", "
                 "\"evidence\": [%s], \"suspect\": \"%s\", \"rtt_ms\": %.2f, \"ttl\": %d, "
                 "\"ports\": [%s], \"refused\": %d, \"banner\": \"%s\", \"labels\": [%s], "
                 "\"guess\": \"%s\", \"mac\": \"%s\", \"vendor\": \"%s\", "
                 "\"camera\": %s, \"camera_evidence\": \"%s\"}%s\n",
-                ipbuf, en, es, evs,
+                ipbuf, en, nsrc, es, evs,
                 h->suspect == 2 ? "gateway_proxy" : (h->suspect == 1 ? "icmp_only" : "none"),
                 h->rtt, h->ttl, ports, h->nrefused, eb, labels, device_guess(h), h->mac,
                 h->vendor, h->is_cam ? "true" : "false", ec, i + 1 < n ? "," : "");
@@ -2570,6 +2770,7 @@ static int g_nports;
 static int g_no_http;
 static int g_no_cam;
 static int g_no_nbns;
+static int g_no_ptr;
 
 /* 网关基线。g_gw = 0 表示没拿到，此时完全不做「疑似代答」推断 */
 static uint32_t g_gw;
@@ -2653,7 +2854,8 @@ static void *enrich_worker(void *arg)
         if (!h->alive)
             continue;
         h->ip = g_t[i];
-        rdns(g_t[i], h->name, sizeof h->name);
+        if (!h->pname[0])
+            rdns(g_t[i], h->pname, sizeof h->pname); /* 批量问过之后的兜底 */
         if (!g_no_http) {
             for (int k = 0; k < NHTTP; k++) {
                 if (!has_port(h, HTTP_PORTS[k].port))
@@ -2717,6 +2919,7 @@ static void usage(void)
            "      --no-mdns                跳过 mDNS\n"
            "      --no-ssdp                跳过 SSDP/UPnP\n"
            "      --no-nbns                跳过 NetBIOS 名称查询\n"
+           "      --no-ptr                 不问反向 DNS / LLMNR（名字只剩设备自报）\n"
            "      --no-http                不抓 Web 标题 / Server 头\n"
            "      --no-cam                 跳过摄像头指纹（WS-Discovery/RTSP/ONVIF）\n"
            "      --json <路径>            导出 JSON\n"
@@ -2746,6 +2949,7 @@ int main(int argc, char **argv)
         {"no-mdns", no_argument, NULL, 3},
         {"no-ssdp", no_argument, NULL, 4},
         {"no-nbns", no_argument, NULL, 9},
+        {"no-ptr", no_argument, NULL, 11},
         {"no-http", no_argument, NULL, 5},
         {"no-cam", no_argument, NULL, 8},
         {"json", required_argument, NULL, 6},
@@ -2763,6 +2967,7 @@ int main(int argc, char **argv)
         case 1: g_timeout_ms = atoi(optarg); break;
         case 10: g_live_ms = atoi(optarg); break;
         case 9: g_no_nbns = 1; break;
+        case 11: g_no_ptr = 1; break;
         case 2: threads = atoi(optarg); break;
         case 3: no_mdns = 1; break;
         case 4: no_ssdp = 1; break;
@@ -2909,6 +3114,31 @@ int main(int argc, char **argv)
 
     run_workers(icmp_worker, threads, nt);
     run_workers(port_worker, threads, nt);
+
+    /* 名字在 enrich 之前问：拿到租约名的主机就不必再走系统解析器 */
+    if (!g_no_ptr) {
+        uint32_t ptrsrv = g_gw ? g_gw : ((targets[0] & 0xFFFFFF00u) | 1u);
+        uint16_t ptrport = 53;
+        const char *env = getenv("HAKU_PTR_SERVER");
+        if (env && *env) {
+            char hostbuf[64];
+            snprintf(hostbuf, sizeof hostbuf, "%s", env);
+            char *colon = strrchr(hostbuf, ':');
+            if (colon) {
+                int p;
+                *colon = 0;
+                p = atoi(colon + 1);
+                if (p > 0 && p < 65536)
+                    ptrport = (uint16_t)p;
+            }
+            struct in_addr a;
+            if (inet_pton(AF_INET, hostbuf, &a) == 1)
+                ptrsrv = ntohl(a.s_addr);
+        }
+        ptr_batch(slots, nt, ptrsrv, ptrport);
+        llmnr_batch(slots, nt);
+    }
+
     run_workers(enrich_worker, threads, nt);
 
     if (has_mdns)
@@ -2986,12 +3216,16 @@ int main(int argc, char **argv)
         }
 
         if (!h->name[0]) {
-            if (h->svc[0])
+            if (h->svc[0]) {
                 copy_str(h->name, sizeof h->name, h->svc);
-            else if (h->nlabels)
+                h->name_src = 1;
+            } else if (h->nlabels) {
                 copy_str(h->name, sizeof h->name, h->labels[0]);
-            else if (h->banner[0]) {
-                /* 还空着就用网页标题 —— 比让名称列留 "-" 有用 */
+                h->name_src = 1;
+            } else if (h->pname[0]) {
+                copy_str(h->name, sizeof h->name, h->pname); /* 路由器租约名 */
+                h->name_src = 2;
+            } else if (h->banner[0]) {
                 const char *a = strstr(h->banner, "「");
                 const char *b = a ? strstr(a, "」") : NULL;
                 if (a && b && b > a + 3) {
@@ -3000,6 +3234,7 @@ int main(int argc, char **argv)
                         len = sizeof h->name - 1;
                     memcpy(h->name, a + 3, len);
                     h->name[len] = 0;
+                    h->name_src = 3;
                 }
             }
         }

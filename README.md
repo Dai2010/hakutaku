@@ -23,7 +23,7 @@ haku -t 192.168.2.0/24
 
 - ICMP 存活（调用系统的 `ping`，不依赖原始套接字）
 - TCP 端口扫描（非阻塞 `connect()` + `poll()`，批量并发）；**回 RST 也算证据**，能发现那种挡了 ICMP 却在拒绝连接的设备
-- 反向 DNS、mDNS、SSDP/UPnP、NetBIOS 名称（NBSTAT）
+- 反向 DNS、mDNS、SSDP/UPnP、NetBIOS 名称（NBSTAT）、LLMNR
 - HTTP(S) 横幅：`Server` 头与页面标题
 - 无线侧勘查（Termux 走 `termux-wifi-scaninfo`，桌面 Linux 走 `nmcli` / `iw`）
 - 摄像头指纹：WS-Discovery、RTSP、ONVIF
@@ -76,6 +76,7 @@ haku [选项]
       --no-mdns                跳过 mDNS
       --no-ssdp                跳过 SSDP/UPnP
       --no-nbns                跳过 NetBIOS 名称查询
+      --no-ptr                 不问反向 DNS / LLMNR（名字只剩设备自报）
       --no-http                不抓 Web 标题 / Server 头
       --no-cam                 跳过摄像头指纹
       --json <路径>            导出 JSON
@@ -115,7 +116,8 @@ haku -w --json ~/lan.json
 |---|---|---|
 | 端口接受连接 | 硬 | 真的有人在监听 |
 | 端口回 RST | 硬 | 真的 TCP 栈在——挡掉 ICMP 的网络也能被发现 |
-| mDNS / SSDP / WS-D / NetBIOS 应答 | 硬 | 应用层自报，顺带给出设备名 |
+| mDNS / SSDP / WS-D / NetBIOS / LLMNR 应答 | 硬 | 应用层自报，顺带给出设备名 |
+| 网关 PTR 给出真名字 | 硬 | 它记着这个地址的 DHCP 租约 |
 | ARP 表里的独立 MAC（仅 Linux） | 硬 | 二层真实存在过 |
 | 仅 ICMP echo | 弱 | **代理 ARP 的网关可以替任何空 IP 回包** |
 
@@ -127,20 +129,32 @@ haku -w --json ~/lan.json
 - `ICMP 不回` —— 全程没回 ping，靠端口或服务发现才看见。
 - 不再用 TTL 猜类型：实测同一网段里 TTL 255 的既有 AP/机顶盒也有真机，猜出来的「网络设备」只是噪声；类型说不准就留空。
 
-`--json` 里对应 `evidence: [...]`（`icmp`/`rst`/`tcp`/`mdns`/`ssdp`/`wsd`/`nbstat`/`arp`/`http`）与 `suspect`（`none`/`icmp_only`/`gateway_proxy`），方便自己再过滤。
+`--json` 里对应 `evidence: [...]`（`icmp`/`rst`/`tcp`/`mdns`/`ssdp`/`wsd`/`nbstat`/`rdns`/`llmnr`/`arp`/`http`）、`suspect`（`none`/`icmp_only`/`gateway_proxy`）与 `name_source`（`device`/`router`/`http`/`none`），方便自己再过滤。
 
 ### 设备名从哪来
 
-名字只能由**命名服务**给，按可靠性依次尝试：
+**手机的名字不在手机上。** Android 默认不跑 mDNS responder，也不跑 NetBIOS / LLMNR，扫它一句都不答。名字在**路由器的 DHCP 租约表**里：手机连上时把自己的型号当主机名报给 DHCP（`JEF-AN00`、`M2012K11AC` 这类），dnsmasq 再拿它答 PTR。所以「能不能看到手机名」取决于**路由器**：
 
-| 来源 | 条件 |
+| 网关行为 | 结果 |
 |---|---|
-| 反向 DNS | 路由器 / DHCP 配了 PTR（不少网关把 PTR 直接填成 IP，这种会被丢弃，免得与 IP 列重复） |
-| mDNS / SSDP 实例名 | 设备自己广播，最贴近「人给它起的名字」 |
-| NetBIOS（NBSTAT 137） | Windows / Samba 会回；**先广播再逐台单播** —— AP 与企业网关常丢广播，只发广播会漏 |
-| 网页标题 | 有开放 HTTP 端口时兜底 |
+| 小米 / OpenWrt / 大多数 dnsmasq 网关 | PTR 回租约名 → 手机显示型号名 |
+| 中国电信智能网关（`192.168.1.1` / `.249`） | 对**任何** IP 都回 IP 本身，只有自己回 `router.ctc` → 手机没有名字 |
 
-**什么都没有的，名字就是空的**：只回 RST、不跑任何应答服务的设备（部分 AP、机顶盒、休眠中的手机）没有可问的入口，这不是漏采，是信息本身不存在。想知道这类设备是谁，只能看路由器的客户端列表（要登录后台），或在 Linux 上按 MAC 查厂商。
+名字按可靠性分三级，终端只显示最好的那个，来源记在 JSON 的 `name_source`：
+
+| 级别 | 来源 | 条件 |
+|---|---|---|
+| 设备自报 | mDNS / SSDP / WS-D / NetBIOS / LLMNR | 设备自己答，最贴近「人给它起的名字」；NetBIOS **先广播再逐台单播**，AP 与企业网关常丢广播 |
+| 路由器租约 | PTR（直问网关 53）与 LLMNR | **不走 `getnameinfo`**：Android 开了 Private DNS（DoT）会把查询送去公网，本网段的 PTR 永远问不到路由器。整段一次问完、统一收 1.2 秒窗口 |
+| 网页标题 | 有开放 HTTP 端口时兜底 | 只取 `「…」` 里的标题 |
+
+**网关只回 IP 时，程序会自己说出来**：
+
+```
+注：网关 192.168.1.1 没存设备名（PTR 只把 IP 或 host-x 这类模板回你），所以空名字不是漏采 —— 手机名只能看路由器后台的客户端列表。
+```
+
+出现这一行，就别再在工具上找原因了：这台网关不保存租约名，手机名只能登录后台看（或换一台会答 PTR 的路由器）。程序也不会把这种「答了但没内容」的结果算成设备存在的证据。
 
 很多 AP 与企业网关会过滤组播，mDNS 的 `224.0.0.251` 直接到不了设备 —— 这时会对**已经发现的主机**逐个单播问一遍 5353（每台一次，收 1.2 秒）。**不要对整段做单播**：给 254 台各发 15 个包会触发大量 ARP 排队，`sendto` 会卡到分钟级，这一点实测过。
 
@@ -200,6 +214,7 @@ ssh <host> "grep -F '(hex)' /usr/share/ieee-data/oui.txt \
 |---|---|
 | `HAKU_ARP_FILE` | 覆盖 ARP 表路径（测试用） |
 | `HAKU_OUI_FILE` | 指定 OUI 库（`oui.txt` / `nmap-mac-prefixes` 格式都认） |
+| `HAKU_PTR_SERVER` | PTR 问哪台 DNS（`ip` 或 `ip:port`，默认网关的 53） |
 | `COLUMNS` | 覆盖终端宽度（排版用） |
 
 ## 测试
@@ -224,6 +239,22 @@ python3 tests/cam_stub.py --wsd-device &
 
 第 2、3 条要把**本机 LAN IP 一起列进目标**：桩跑在同一台机器上，回包的源地址是本机 LAN IP，不在目标列表里就会被丢弃（扫描整段时不存在这个问题）。
 
+命名这条也同样有桩（`tests/ptr_stub.py`），因为真网关不一定配合：
+
+```sh
+# 4) 会答租约名的网关：名称列应为 JEF-AN00，且**不**出现「PTR 只把 IP…」的注
+python3 tests/ptr_stub.py --port 5354 --name JEF-AN00 &
+HAKU_PTR_SERVER=127.0.0.1:5354 ./haku -t 127.0.0.2 -p 22 \
+    --no-mdns --no-ssdp --no-nbns --no-cam
+
+# 5) 只回 IP 的网关（复刻中国电信智能网关）：名称列留空，但必须打出那一行注
+python3 tests/ptr_stub.py --port 5354 --dumb &
+HAKU_PTR_SERVER=127.0.0.1:5354 ./haku -t 127.0.0.2 -p 22 \
+    --no-mdns --no-ssdp --no-nbns --no-cam
+```
+
+用 `127.0.0.2` 而不是 `127.0.0.1`：后者会被系统解析器答成 `localhost`，把这个桩的效果盖掉。
+
 ## 已知限制
 
 - **没有哪种单条信号能通吃所有网络**。这里能说的是：不回 ICMP 的会被端口探测补上，回 ICMP 但什么都没有的会被标成弱证据，而不是直接算作设备。
@@ -234,7 +265,9 @@ python3 tests/cam_stub.py --wsd-device &
 - 分段小范围端口扫描可能漏掉开放端口（有些设备对未开放端口丢包而非拒绝）；要全端口用 `-p 1-65535`，或用 `nmap -sT -Pn -p-`。
 - 反查名与 NetBIOS 名可能过期（设备改名后路由器/缓存要过一阵才更新）。
 - 客户端隔离（AP isolation）下看不到同级设备，这由网络策略决定，工具无解。
-- **组播被过滤时**：mDNS/SSDP/WS-D 的组播到不了设备，只能靠「对已发现主机单播」补名字与指纹；补不到的（多数手机、部分 IoT）就永远没有名字。
+- **组播被过滤时**：mDNS/SSDP/WS-D 的组播到不了设备，只能靠「对已发现主机单播」补名字与指纹。
+- **手机名取决于路由器**：名字来自 DHCP 租约（见[设备名从哪来](#设备名从哪来)）。网关不保存租约名、也不答 PTR 时，手机在这张网上就是没有名字可查 —— 这不是漏采，工具也变不出来。
+- **PTR 归类靠问句**：答复归给谁按问题段里的 `in-addr.arpa` 名反推，因此一个网关把所有地址都答成同一个名字时，只会被判成「没有名字」，不会张冠李戴。
 - `nmcli` / `iw` 分支只在没有无线网卡的机器上验证过"缺失时优雅退让"，真无线网卡路径欢迎反馈。
 
 ## 安全与合法使用
