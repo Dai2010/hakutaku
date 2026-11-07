@@ -497,6 +497,16 @@ static void rdns(uint32_t ip, char *out, size_t n)
  * Android 上这个文件被 SELinux 挡住，读不到就静默跳过（不显示 MAC 列）。
  * HAKU_ARP_FILE 是给测试用的覆盖入口。
  */
+static int arp_available(void)
+{
+    const char *path = getenv("HAKU_ARP_FILE");
+    FILE *f = fopen(path && *path ? path : "/proc/net/arp", "r");
+    if (!f)
+        return 0;
+    fclose(f);
+    return 1;
+}
+
 static int arp_lookup(uint32_t ip, char *out, size_t outsz)
 {
     const char *path = getenv("HAKU_ARP_FILE");
@@ -1783,12 +1793,12 @@ static host_t *slot_at(uint32_t ip)
 
 /* 整段一次问完再统一收窗口；逐台问会让不答 PTR 的网关把时间乘上 254。
  * unicast_all=1：每台各问一个（LLMNR）；0：全问同一台服务器（网关 DNS）。 */
-static void rdns_batch(host_t *slots, int nt, unsigned evbit, int window_ms, int unicast_all,
-                       uint32_t server, uint16_t port)
+static int rdns_batch(host_t *slots, int nt, unsigned evbit, int window_ms, int unicast_all,
+                      uint32_t server, uint16_t port)
 {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0)
-        return;
+        return 0;
     int asked = 0;
     for (int i = 0; i < nt; i++) {
         if (!slots[i].alive || slots[i].pname[0])
@@ -1808,10 +1818,10 @@ static void rdns_batch(host_t *slots, int nt, unsigned evbit, int window_ms, int
     }
     if (asked == 0) {
         close(fd);
-        return;
+        return 0;
     }
 
-    int junk = 0;
+    int got = 0, junk = 0;
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     uint8_t buf[2048];
@@ -1839,21 +1849,50 @@ static void rdns_batch(host_t *slots, int nt, unsigned evbit, int window_ms, int
         if (!h->pname[0]) {
             copy_str(h->pname, sizeof h->pname, nm);
             h->ev |= evbit;
+            got++;
         }
     }
     close(fd);
 
     if (unicast_all)
-        return; /* LLMNR 不回话是常态，不据此下判断 */
+        return got; /* LLMNR 不回话是常态，不据此下判断 */
     g_ptr_asked += asked;
     g_ptr_junk += junk;
     if (!g_ptr_dumb && junk * 2 >= asked && junk >= 1)
         g_ptr_dumb = server;
+    return got;
 }
 
-static void ptr_batch(host_t *slots, int nt, uint32_t server, uint16_t port)
+/* Linux 的解析器常常不是网关（systemd-resolved 是 127.0.0.53），先问它 */
+static int resolv_servers(uint32_t *out, int max)
 {
-    rdns_batch(slots, nt, EV_RDNS, 1200, 0, server, port);
+    FILE *f = fopen("/etc/resolv.conf", "r");
+    int n = 0;
+    if (!f)
+        return 0;
+    char line[256];
+    while (n < max && fgets(line, sizeof line, f)) {
+        char ip[64];
+        struct in_addr a;
+        if (sscanf(line, " nameserver %63s", ip) != 1)
+            continue;
+        if (inet_pton(AF_INET, ip, &a) != 1 || a.s_addr == 0)
+            continue;
+        uint32_t v = ntohl(a.s_addr);
+        int dup = 0;
+        for (int i = 0; i < n; i++)
+            if (out[i] == v)
+                dup = 1;
+        if (!dup)
+            out[n++] = v;
+    }
+    fclose(f);
+    return n;
+}
+
+static int ptr_batch(host_t *slots, int nt, uint32_t server, uint16_t port)
+{
+    return rdns_batch(slots, nt, EV_RDNS, 1200, 0, server, port);
 }
 
 static void llmnr_batch(host_t *slots, int nt)
@@ -2612,8 +2651,8 @@ static void render(host_t **alive, int n, const char *own, const char *subnet, i
     if (g_ptr_dumb) {
         char gw[16];
         u32_to_ip(g_ptr_dumb, gw);
-        printf("注：网关 %s 没存设备名（PTR 只把 IP 或 host-x 这类模板回你），所以空名字不是"
-               "漏采 —— 手机名只能看路由器后台的客户端列表。\n", gw);
+        printf("注：DNS 服务器 %s 没存设备名（PTR 只把 IP 或 host-x 这类模板回你），所以空名字"
+               "不是漏采 —— 手机名只能看路由器后台的客户端列表。\n", gw);
         printf("\n");
     }
 
@@ -3119,6 +3158,7 @@ int main(int argc, char **argv)
     if (!g_no_ptr) {
         uint32_t ptrsrv = g_gw ? g_gw : ((targets[0] & 0xFFFFFF00u) | 1u);
         uint16_t ptrport = 53;
+        int fixed = 0;
         const char *env = getenv("HAKU_PTR_SERVER");
         if (env && *env) {
             char hostbuf[64];
@@ -3132,10 +3172,27 @@ int main(int argc, char **argv)
                     ptrport = (uint16_t)p;
             }
             struct in_addr a;
-            if (inet_pton(AF_INET, hostbuf, &a) == 1)
+            if (inet_pton(AF_INET, hostbuf, &a) == 1) {
                 ptrsrv = ntohl(a.s_addr);
+                fixed = 1;
+            }
         }
-        ptr_batch(slots, nt, ptrsrv, ptrport);
+        if (fixed) {
+            ptr_batch(slots, nt, ptrsrv, ptrport);
+        } else {
+            /* 先问 /etc/resolv.conf 里的解析器（Android 没有这个文件） */
+            uint32_t srv[3];
+            int nsrv = resolv_servers(srv, 2);
+            int named = 0;
+            for (int k = 0; k < nsrv; k++)
+                named += ptr_batch(slots, nt, srv[k], ptrport);
+            int dup = 0;
+            for (int k = 0; k < nsrv; k++)
+                if (srv[k] == ptrsrv)
+                    dup = 1;
+            if (named == 0 && !dup)
+                ptr_batch(slots, nt, ptrsrv, ptrport);
+        }
         llmnr_batch(slots, nt);
     }
 
@@ -3296,6 +3353,9 @@ int main(int argc, char **argv)
     if (nmac > 0)
         printf("\n注：%d 台的 MAC 取自 %s；厂商来自本机 OUI 库（%d 条）。\n", nmac,
                getenv("HAKU_ARP_FILE") ? getenv("HAKU_ARP_FILE") : "/proc/net/arp", g_noui);
+    else if (arp_available())
+        printf("\n注：ARP 表能读，但这次没有主机落在里面（跨网段或只扫本机时就是这样），"
+               "不是权限问题。\n");
     else
         printf("\n注：读不到 ARP 表（Android 无 root 时 SELinux 会挡住），所以没有 MAC；"
                "在 Linux 上跑就能拿到。\n");

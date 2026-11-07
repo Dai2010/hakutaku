@@ -148,10 +148,12 @@ haku -w --json ~/lan.json
 | 路由器租约 | PTR（直问网关 53）与 LLMNR | **不走 `getnameinfo`**：Android 开了 Private DNS（DoT）会把查询送去公网，本网段的 PTR 永远问不到路由器。整段一次问完、统一收 1.2 秒窗口 |
 | 网页标题 | 有开放 HTTP 端口时兜底 | 只取 `「…」` 里的标题 |
 
+问谁要 PTR 也按平台分：Linux 先问 `/etc/resolv.conf` 里的解析器（systemd-resolved 的 `127.0.0.53`、公司 DNS、pihole 都可能记着租约名），拿不到名字再问网关；Android 没有这个文件，直接问网关。
+
 **网关只回 IP 时，程序会自己说出来**：
 
 ```
-注：网关 192.168.1.1 没存设备名（PTR 只把 IP 或 host-x 这类模板回你），所以空名字不是漏采 —— 手机名只能看路由器后台的客户端列表。
+注：DNS 服务器 192.168.1.1 没存设备名（PTR 只把 IP 或 host-x 这类模板回你），所以空名字不是漏采 —— 手机名只能看路由器后台的客户端列表。
 ```
 
 出现这一行，就别再在工具上找原因了：这台网关不保存租约名，手机名只能登录后台看（或换一台会答 PTR 的路由器）。程序也不会把这种「答了但没内容」的结果算成设备存在的证据。
@@ -214,7 +216,7 @@ ssh <host> "grep -F '(hex)' /usr/share/ieee-data/oui.txt \
 |---|---|
 | `HAKU_ARP_FILE` | 覆盖 ARP 表路径（测试用） |
 | `HAKU_OUI_FILE` | 指定 OUI 库（`oui.txt` / `nmap-mac-prefixes` 格式都认） |
-| `HAKU_PTR_SERVER` | PTR 问哪台 DNS（`ip` 或 `ip:port`，默认网关的 53） |
+| `HAKU_PTR_SERVER` | 只问这一台 DNS（`ip` 或 `ip:port`；不设则先问 `/etc/resolv.conf` 里的解析器，拿不到再问网关 53） |
 | `COLUMNS` | 覆盖终端宽度（排版用） |
 
 ## 测试
