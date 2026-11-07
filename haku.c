@@ -841,6 +841,10 @@ enum {
 /* 除 ICMP 以外都算「有独立证据」：代理 ARP 不会替别人应答这些 */
 #define EV_L3 (EV_ARP | EV_RST | EV_TCP | EV_MDNS | EV_SSDP | EV_WSD | EV_NBNS | EV_HTTP)
 
+/* 并发阶段共享的目标表；监听线程（nbns 单播）也要用，所以定义在标签表这一层 */
+static uint32_t *g_t;
+static int g_nt;
+
 typedef struct {
     uint32_t ip;
     unsigned ev;
@@ -874,6 +878,8 @@ typedef struct {
     char vendor[48];
 } host_t;
 
+static host_t *g_slots;
+
 static void labeltab_add(labeltab_t *t, uint32_t ip, unsigned ev, int nvt, const char *text)
 {
     if (!text || !*text)
@@ -893,6 +899,8 @@ static void labeltab_add(labeltab_t *t, uint32_t ip, unsigned ev, int nvt, const
         t->cap = cap;
     }
     t->v[t->n].ip = ip;
+    t->v[t->n].ev = ev;
+    t->v[t->n].nvt = nvt;
     snprintf(t->v[t->n].text, sizeof t->v[t->n].text, "%s", text);
     t->n++;
 }
@@ -1077,6 +1085,8 @@ static void split_srv(const char *owner, char *inst, size_t instsz, char *svc, s
     }
 }
 
+static void mdns_emit(const rr_t *rrs, int nrr, labeltab_t *tab);
+
 static void *mdns_thread(void *arg)
 {
     labeltab_t *tab = arg;
@@ -1131,6 +1141,14 @@ static void *mdns_thread(void *arg)
     }
     close(fd);
 
+    mdns_emit(rrs, nrr, tab);
+    free(rrs);
+    return NULL;
+}
+
+/* 把解析出来的记录折成「地址 -> 标签」，组播与单播两条路共用 */
+static void mdns_emit(const rr_t *rrs, int nrr, labeltab_t *tab)
+{
     /* name -> ip，用于把 SRV 实例挂到具体地址上 */
     enum { MAXN = 160 };
     static char nm[MAXN][128], ipv[MAXN][46];
@@ -1169,8 +1187,6 @@ static void *mdns_thread(void *arg)
             labeltab_add(tab, ip, EV_MDNS, 0, label);
         }
     }
-    free(rrs);
-    return NULL;
 }
 
 /* ---------------------------------------------------------------- SSDP */
@@ -1285,6 +1301,19 @@ static void *nbns_thread(void *arg)
     dst.sin_addr.s_addr = INADDR_BROADCAST;
     sendto(fd, q, sizeof q, 0, (struct sockaddr *)&dst, sizeof dst);
 
+    /*
+     * 广播之外再逐个单播：AP、企业网关、开了组播过滤的网络会丢广播，
+     * 单播才收得到答复。几百个 UDP 包，代价可以忽略。
+     */
+    for (int i = 0; i < g_nt; i++) {
+        struct sockaddr_in uni;
+        memset(&uni, 0, sizeof uni);
+        uni.sin_family = AF_INET;
+        uni.sin_port = htons(137);
+        uni.sin_addr.s_addr = htonl(g_t[i]);
+        sendto(fd, q, sizeof q, 0, (struct sockaddr *)&uni, sizeof uni);
+    }
+
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     uint8_t buf[2048];
@@ -1300,21 +1329,28 @@ static void *nbns_thread(void *arg)
         ssize_t n = recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
         if (n <= 0)
             break;
-        /* 头 12 + 编码名 33 + type/class/ttl/rdlen 10 = 55，之后是名字表 */
-        if (n < 57)
+        /* 不能按固定偏移切：答案名可能被压缩（0xC0 指针），偏移会变。
+         * 用 dns_read_name 跳过名字，再按 DNS 头字段取 rdata。 */
+        if (n < 12)
             continue;
-        int cnt = buf[55];
-        if (cnt < 1 || 56 + cnt * 18 > (int)n)
+        char qname[128];
+        int off = dns_read_name(buf, (int)n, 12, qname, sizeof qname);
+        if (off < 0 || off + 10 > (int)n)
             continue;
+        int rtype = (buf[off] << 8) | buf[off + 1];
+        int rdlen = (buf[off + 8] << 8) | buf[off + 9];
+        int rdata = off + 10;
+        if (rtype != 0x0021 || rdlen < 19 || rdata + rdlen > (int)n)
+            continue;
+        int cnt = buf[rdata];
+        if (cnt < 1 || rdata + 1 + cnt * 18 > (int)n)
+            continue;
+        /* 每条 18 字节：15 字节名字（空格补齐）+ 1 字节后缀 + 2 字节标志 */
         char name[16];
-        memcpy(name, buf + 56, 15);
+        memcpy(name, buf + rdata + 1, 15);
         name[15] = 0;
-        for (int k = 14; k >= 0; k--) {
-            if (name[k] == ' ' || name[k] == 0)
-                name[k] = 0;
-            else
-                break;
-        }
+        for (int k = (int)strlen(name) - 1; k >= 0 && name[k] == ' '; k--)
+            name[k] = 0;
         if (!name[0])
             continue;
         uint32_t ip = ntohl(from.sin_addr.s_addr);
@@ -1544,10 +1580,18 @@ static void camera_check(host_t *h)
 
     /*
      * Web / ONVIF 探测不写死端口表：摄像头挂在 8081、8000、9000 甚至随机高位端口
-     * 都很常见。按「实际开放的端口」逐个试，跳掉确定不是 HTTP 的那些，最多试 3 个。
+     * 都很常见。按「实际开放的端口」逐个试，最多 3 个。
+     *
+     * 两道闸：
+     *   1) 跳过明确不是 HTTP 的端口，其中 9100 / 515 是裸打印口 ——
+     *      把字节灌进去会直接印出来（2026-11-07 实际发生过：一台 HP 打印机
+     *      把 ONVIF 的 HTTP POST 原文打了出来）。
+     *   2) 先发一个普通 GET，**确认它按 HTTP 应答**才发 ONVIF SOAP。
+     *      非 HTTP 服务收到 SOAP 可能产生副作用，光靠端口黑名单不够。
      */
-    static const int not_web[] = {21, 22, 23, 25, 53, 110, 139, 143, 445, 515, 631,
-                                  993, 995, 1883, 3306, 3389, 5900, 62078};
+    static const int not_web[] = {21,  22,   23,   25,  53,   110, 139, 143,
+                                  445, 515,  631,  9100, 993, 995, 1883, 3306,
+                                  3389, 5900, 62078};
     int tried = 0;
     for (int i = 0; i < h->nports && tried < 3; i++) {
         int port = h->ports[i];
@@ -1557,12 +1601,78 @@ static void camera_check(host_t *h)
                 skip = 1;
         if (skip)
             continue;
+        char probe[160];
+        if (http_banner(h->ip, port, 0, probe, sizeof probe) != 0)
+            continue; /* 不是 HTTP，别往上灌 SOAP */
         tried++;
         if (onvif_probe(h->ip, port, ev, sizeof ev) == 0)
             cam_append(h, "%s", ev);
         else if (web_keyword_ok && cam_keyword(h->ip, port, ev, sizeof ev) == 0)
             cam_append(h, "%s", ev);
     }
+}
+
+/* ---------------------------------------------------------------- 单播兜底 */
+
+/*
+ * 组播兜底：AP、企业网关、开了组播过滤的网络（实测家里的电信网关就是）
+ * 会把 224.0.0.251 挡掉，只有直接问 (ip, 5353) 才有人答。
+ *
+ * 只对**已发现**的主机发（每台 NSERVICES 个查询），统一收 1.2 秒。
+ * 绝不对整个网段刷：未解析地址会触发大量 ARP 排队，sendto 会直接卡住 ——
+ * 2026-11-07 给 254 台各发 15 个包实测要 54 秒，就是踩了这个。
+ */
+static void unicast_mdns(host_t *slots, int nt, labeltab_t *tab)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return;
+    uint8_t q[256];
+    int sent = 0;
+    for (int i = 0; i < nt; i++) {
+        if (!slots[i].alive)
+            continue;
+        struct sockaddr_in one;
+        memset(&one, 0, sizeof one);
+        one.sin_family = AF_INET;
+        one.sin_port = htons(5353);
+        one.sin_addr.s_addr = htonl(slots[i].ip);
+        for (int k = 0; k < NSERVICES; k++) {
+            int qn = build_query(q, sizeof q, SERVICES[k], 12);
+            if (qn > 0)
+                sendto(fd, q, (size_t)qn, 0, (struct sockaddr *)&one, sizeof one);
+        }
+        sent++;
+    }
+    if (sent == 0) {
+        close(fd);
+        return;
+    }
+
+    rr_t *rrs = calloc(1024, sizeof *rrs);
+    if (!rrs) {
+        close(fd);
+        return;
+    }
+    int nrr = 0;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint8_t buf[9000];
+    while (ms_since(&t0) < 1200) {
+        struct pollfd p = {fd, POLLIN, 0};
+        int left = 1200 - ms_since(&t0);
+        if (left > 250)
+            left = 250;
+        if (poll(&p, 1, left) <= 0)
+            continue;
+        ssize_t n = recv(fd, buf, sizeof buf, 0);
+        if (n <= 0)
+            break;
+        mdns_parse(buf, (int)n, rrs, &nrr, 1024);
+    }
+    close(fd);
+    mdns_emit(rrs, nrr, tab);
+    free(rrs);
 }
 
 /* WS-Discovery：海康/大华这类 ONVIF 摄像头会回 ProbeMatch */
@@ -2188,7 +2298,8 @@ static void host_note(const host_t *h, char *note, size_t cap)
         note_app(note, cap, tmp);
     }
     note_app(note, cap, h->banner);
-    if (h->nlabels)
+    /* svc 与首个标签常常是同一句话，别在说明里重复两遍 */
+    if (h->nlabels && (!h->svc[0] || strcmp(h->labels[0], h->svc) != 0))
         note_app(note, cap, h->labels[0]);
     /* 有端口拒绝但没有开放端口：设备在，只是 ICMP 被挡、端口全关 */
     if (h->nports == 0 && h->nrefused > 0)
@@ -2451,9 +2562,6 @@ static int write_json(const char *path, host_t **alive, int n, const char *own,
 
 /* ---------------------------------------------------------------- 并行 */
 
-static uint32_t *g_t;
-static int g_nt;
-static host_t *g_slots;
 static int g_cursor;
 static int g_timeout_ms = 700;
 static int g_live_ms = 300;
@@ -2468,6 +2576,14 @@ static uint32_t g_gw;
 static double g_gw_rtt;
 static int g_gw_ttl;
 static char g_gw_mac[20];
+
+/* 目标表要在起监听线程之前就位：nbns 的单播阶段要用它 */
+static void set_targets(uint32_t *t, int n, host_t *slots)
+{
+    g_t = t;
+    g_nt = n;
+    g_slots = slots;
+}
 
 /* 阶段一：ICMP 只记证据，不下结论 —— 代理 ARP 也能替别人回包 */
 static void *icmp_worker(void *arg)
@@ -2555,12 +2671,8 @@ static void *enrich_worker(void *arg)
     return NULL;
 }
 
-static void run_workers(void *(*fn)(void *), int nthreads, uint32_t *targets, int nt,
-                        host_t *slots)
+static void run_workers(void *(*fn)(void *), int nthreads, int nt)
 {
-    g_t = targets;
-    g_nt = nt;
-    g_slots = slots;
     g_cursor = 0;
     if (nthreads > MAXTHREADS)
         nthreads = MAXTHREADS;
@@ -2784,6 +2896,8 @@ int main(int argc, char **argv)
         }
     }
 
+    set_targets(targets, nt, slots);
+
     if (!no_mdns && pthread_create(&t_mdns, NULL, mdns_thread, &mtab) == 0)
         has_mdns = 1;
     if (!no_ssdp && pthread_create(&t_ssdp, NULL, ssdp_thread, &stab) == 0)
@@ -2793,9 +2907,9 @@ int main(int argc, char **argv)
     if (!g_no_nbns && pthread_create(&t_nbns, NULL, nbns_thread, &ntab) == 0)
         has_nbns = 1;
 
-    run_workers(icmp_worker, threads, targets, nt, slots);
-    run_workers(port_worker, threads, targets, nt, slots);
-    run_workers(enrich_worker, threads, targets, nt, slots);
+    run_workers(icmp_worker, threads, nt);
+    run_workers(port_worker, threads, nt);
+    run_workers(enrich_worker, threads, nt);
 
     if (has_mdns)
         pthread_join(t_mdns, NULL);
@@ -2805,6 +2919,10 @@ int main(int argc, char **argv)
         pthread_join(t_wsd, NULL);
     if (has_nbns)
         pthread_join(t_nbns, NULL);
+
+    /* 组播被过滤时靠单播补名字；放在 join 之后，避免与监听线程同时改 mtab */
+    if (!no_mdns)
+        unicast_mdns(slots, nt, &mtab);
 
     host_t **alive = malloc((size_t)nt * sizeof *alive);
     if (!alive) {
